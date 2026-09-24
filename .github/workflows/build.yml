@@ -38,4 +38,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: firmware
-          path: micropython/ports/esp32/build-SEEED_XIAO_EE02
+          path: |
+            micropython/ports/esp32/build-SEEED_XIAO_EE02/bootloader/bootloader.bin 
+            micropython/ports/esp32/build-SEEED_XIAO_EE02/partition_table/partition-table.bin
+            micropython/ports/esp32/build-SEEED_XIAO_EE02/ota_data_initial.bin 
+            micropython/ports/esp32/build-SEEED_XIAO_EE02/micropython.bin
