@@ -11,6 +11,8 @@ jobs:
   build:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.2
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
@@ -21,10 +23,11 @@ jobs:
 
       # Runs a single command using the runners shell
       - name: Run a one-line script
-        run: find .
+        run: make -C micropython/mpy-cross
 
       # Runs a set of commands using the runners shell
       - name: Run a multi-line script
         run: |
           echo Add other actions to build,
           echo test, and deploy your project.
+
