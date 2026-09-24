@@ -22,12 +22,12 @@ jobs:
           submodules: 'true'
 
       # Runs a single command using the runners shell
-      - name: Run a one-line script
+      - name: Micropython cross
         run: make -C micropython/mpy-cross
 
       # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Build
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          cd micropython/ports/esp32
+          make BOARD=ESP32_GENERIC_S3 BOARD_VARIANT=SPIRAM_OCT USER_C_MODULES=../../Inkplate-micropython/firmware/usermods/inkplate
 
