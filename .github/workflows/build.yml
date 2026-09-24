@@ -28,6 +28,6 @@ jobs:
       # Runs a set of commands using the runners shell
       - name: Build
         run: |
+          . $IDF_PATH/export.sh
           cd micropython/ports/esp32
           make BOARD=ESP32_GENERIC_S3 BOARD_VARIANT=SPIRAM_OCT USER_C_MODULES=../../Inkplate-micropython/firmware/usermods/inkplate
-
