@@ -76,21 +76,21 @@ const spi_panel_config_t spi_panel_config_inkplate13spectra = {
     .width = 1200,
     .height = 1600,
 
-    .pin_rst = 4,
-    .pin_dc = 14,
-    .pin_cs = 42,
-    .pin_busy = 7,
-    .pin_clk = 38,
-    .pin_din = 40,
+    .pin_rst = 38, //
+    .pin_dc = 10, // https://github.com/Seeed-Studio/Seeed_GFX2/blob/7c17627f7a71b849fbafabd43724c602a6ba96fe/src/board/configs/XIAO_ePaper_Board_Configs.h#L59
+    .pin_cs = 44, //         return BoardPinConfig(44, dc, 38, -1, mosi - D10, -1/ miso, D8, -1, -1, 4, 43, cs2)
+    .pin_busy = 4, //
+    .pin_clk = 7, // d8! 7?
+    .pin_din = 9, // mosi? 9
 
     .spi_freq_hz = 10000000,
 
     .chip_count = 2,
 
-    .pin_cs2 = 39,
-    .pin_pwr_en = 21,
-    .pin_bs0 = 6,
-    .pin_bs1 = 5,
+    .pin_cs2 = 41, // https://github.com/Seeed-Studio/Seeed_GFX2/blob/7c17627f7a71b849fbafabd43724c602a6ba96fe/src/board/configs/XIAO_ePaper_Board_Configs.h#L59
+    .pin_pwr_en = 43,// 43?
+    .pin_bs0 = -1, // suggested by Ai that these are hardwired on the ee02
+    .pin_bs1 = -1,
 };
 
 // Inkplate7SPECTRA (800x480 native controller resolution, 4bpp/6-color GDEP-family
