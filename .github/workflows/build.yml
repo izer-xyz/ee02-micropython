@@ -29,6 +29,7 @@ jobs:
       - name: Build
         run: |
           . $IDF_PATH/export.sh
+          cp -rf patch/* .
           cd micropython/ports/esp32
-          make BOARD=SEEED_XIAO_ESP32S3  submodules
-          make BOARD=SEEED_XIAO_ESP32S3  USER_C_MODULES=../../../../Inkplate-micropython/firmware/usermods/inkplate
+          make BOARD=SEEED_XIAO_EE02  submodules
+          make BOARD=SEEED_XIAO_EE02  USER_C_MODULES=../../../../Inkplate-micropython/firmware/usermods/inkplate
