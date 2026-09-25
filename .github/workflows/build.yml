@@ -32,7 +32,7 @@ jobs:
           cp -rf patch/* .
           cd micropython/ports/esp32
           make BOARD=SEEED_XIAO_EE02 submodules
-          make BOARD=SEEED_XIAO_EE02 USER_C_MODULES=../../../../Inkplate-micropython/firmware/usermods/inkplate
+          make BOARD=SEEED_XIAO_EE02 FROZEN_MANIFEST=../../../../manifest.py
           cd build-SEEED_XIAO_EE02
           python -m esptool --chip esp32s3 merge_bin -o firmware.bin "@flash_args"
           
