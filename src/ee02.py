@@ -79,7 +79,7 @@ CHIP_BOTH = const(3)
 # Only one Inkplate() instance is ever created, so state lives on the instance rather
 # than the class. draw_bmp/png/jpg_from_sd/_from_web and draw_color_image come from
 # shared/mixins/inkplate_image_palette_mixin.py, shared with inkplate6color.
-class Inkplate(ImagePaletteMixin):
+class Ee02(ImagePaletteMixin):
     # Color constants -- values are panel color indices.
     # User passes 0-5; _color_palette maps to actual panel values.
     BLACK = const(0)
