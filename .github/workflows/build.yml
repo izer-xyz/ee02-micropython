@@ -29,10 +29,11 @@ jobs:
       - name: Build
         run: |
           . $IDF_PATH/export.sh
+          MANIFEST=`pwd`/manifest.py
           cp -rf patch/* .
           cd micropython/ports/esp32
           make BOARD=SEEED_XIAO_EE02 submodules
-          make BOARD=SEEED_XIAO_EE02 FROZEN_MANIFEST=../../../../manifest.py
+          make BOARD=SEEED_XIAO_EE02 FROZEN_MANIFEST=$MANIFEST
           cd build-SEEED_XIAO_EE02
           python -m esptool --chip esp32s3 merge_bin -o firmware.bin "@flash_args"
           
