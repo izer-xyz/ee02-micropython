@@ -33,13 +33,20 @@ jobs:
           cd micropython/ports/esp32
           make BOARD=SEEED_XIAO_EE02 submodules
           make BOARD=SEEED_XIAO_EE02 USER_C_MODULES=../../../../Inkplate-micropython/firmware/usermods/inkplate
-
+          cd build-SEEED_XIAO_EE02
+          python -m esptool --chip esp32s3 merge_bin -o firmware.bin "@flash_args"
+          
       - name: Upload Firmware
         uses: actions/upload-artifact@v7
         with:
           name: firmware
-          path: |
-            micropython/ports/esp32/build-SEEED_XIAO_EE02/bootloader/bootloader.bin 
-            micropython/ports/esp32/build-SEEED_XIAO_EE02/partition_table/partition-table.bin
-            micropython/ports/esp32/build-SEEED_XIAO_EE02/ota_data_initial.bin 
-            micropython/ports/esp32/build-SEEED_XIAO_EE02/micropython.bin
+          archive: false
+          path: micropython/ports/esp32/build-SEEED_XIAO_EE02/firmware.bin 
+
+      - name: Upload OTA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ota
+          archive: false
+          path: micropython/ports/esp32/build-SEEED_XIAO_EE02/micropython.bin 
+ 
