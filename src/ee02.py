@@ -4,7 +4,6 @@ import time
 import os
 from machine import ADC, I2C, SPI, Pin, SDCard
 from micropython import const
-from shapes import Shapes
 from machine import Pin as mPin
 from gfx import GFX
 import machine
