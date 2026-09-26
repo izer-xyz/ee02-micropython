@@ -85,7 +85,7 @@ RTC_RAM_by = 0x03
 RTC_DAY_ADDR = 0x07
 RTC_SECOND_ADDR = 0x04
 
-class Inkplate:
+class Ee02:
     # Color constants - values are panel color indices
     # User passes 0-5, _colorPalette maps to actual panel values
     BLACK = const(0)
