@@ -1,23 +1,32 @@
-"""MicroPython driver for the EE03 13 SPECTRA e-paper display."""
-
-# modified version of Inkplate-micropython/boards/inkplate13spectra/inkplate13_spectra.py
-
+# MicroPython driver for Inkplate 13 SPECTRA
+# Ported from Arduino Inkplate13Driver implementation
 import time
 import os
-from machine import ADC, I2C, SDCard, Pin
+from machine import ADC, I2C, SPI, Pin, SDCard
 from micropython import const
-from inkplate_image_palette_mixin import ImagePaletteMixin
-import gfx_standard_font_01 as montserrat_black
+from shapes import Shapes
+from machine import Pin as mPin
+from gfx import GFX
 import machine
-import inkplate
 
 machine.freq(240000000)
 
-# RST/DC/CS_M/CS_S/BUSY/CLK/DIN, PWR_EN, BS0/BS1 and the SPI peripheral itself are owned
-# by the C dual-chip SPI transport (firmware/usermods/inkplate/epd_spi.c's epd_spi_dual_*
-# functions) -- no Python-side pin constants needed for the panel.
+# Connections between ESP32-S3 and Spectra133 Epaper
+EPAPER_RST_PIN = const(38)
+EPAPER_DC_PIN = const(10)
+EPAPER_CS_M_PIN = const(44)   # Master chip select
+EPAPER_CS_S_PIN = const(41)   # Slave chip select
+EPAPER_BUSY_PIN = const(4)
+EPAPER_SPI_MOSI = const(9)
+EPAPER_SPI_MISO = const(8)
+EPAPER_SPI_SCK = const(7)
+EPAPER_PWR_EN = const(43)
+#EPAPER_BS0 = const(6)
+#EPAPER_BS1 = const(5)
 
-# Spectra133 register addresses.
+pixelMaskGLUT = [0xF, 0xF0]
+
+# Spectra133 register addresses
 SPECTRA133_REG_PSR = const(0x00)
 SPECTRA133_REG_PWR = const(0x01)
 SPECTRA133_REG_POF = const(0x02)
@@ -40,11 +49,8 @@ SPECTRA133_REG_BOOST_VDDP_EN = const(0xB7)
 SPECTRA133_REG_CCSET = const(0xE0)
 SPECTRA133_REG_PWS = const(0xE3)
 SPECTRA133_REG_CMD66 = const(0xF0)
-# Partial Load Window (GDEP133C02) -- selects a sub-rectangle of the panel for
-# display_partial() instead of a full refresh.
-SPECTRA133_REG_PTLW = const(0x83)
 
-# Spectra133 register values.
+# Spectra133 register values (from manufacturer)
 REG_PSR_V = bytes([0xDF, 0x6B])
 REG_PWR_V = bytes([0x0F, 0x00, 0x28, 0x2C, 0x28, 0x38])
 REG_POF_V = bytes([0x00])
@@ -65,23 +71,23 @@ REG_BTST_N_V = bytes([0xD8, 0x18])
 REG_BUCK_BOOST_VDDN_V = bytes([0x01])
 REG_TFT_VCOM_POWER_V = bytes([0x02])
 
-# Epaper resolution.
+# Epaper resolution
 D_COLS = const(1200)
 D_ROWS = const(1600)
 
-# Chip select targets for dual-driver architecture.
+# Chip select targets for dual-driver architecture
 CHIP_MASTER = const(1)
 CHIP_SLAVE = const(2)
 CHIP_BOTH = const(3)
 
-# IO_PIN_
+RTC_I2C_ADDR = 0x51
+RTC_RAM_by = 0x03
+RTC_DAY_ADDR = 0x07
+RTC_SECOND_ADDR = 0x04
 
-# Only one Inkplate() instance is ever created, so state lives on the instance rather
-# than the class. draw_bmp/png/jpg_from_sd/_from_web and draw_color_image come from
-# shared/mixins/inkplate_image_palette_mixin.py, shared with inkplate6color.
-class Ee02(ImagePaletteMixin):
-    # Color constants -- values are panel color indices.
-    # User passes 0-5; _color_palette maps to actual panel values.
+class Inkplate:
+    # Color constants - values are panel color indices
+    # User passes 0-5, _colorPalette maps to actual panel values
     BLACK = const(0)
     WHITE = const(1)
     YELLOW = const(2)
@@ -89,661 +95,598 @@ class Ee02(ImagePaletteMixin):
     BLUE = const(4)
     GREEN = const(5)
 
-    # Maps user color index (0-5) to panel register value.
-    _color_palette = [0, 1, 2, 3, 5, 6]
+    # Maps user color index (0-5) to panel register value
+    _colorPalette = [0, 1, 2, 3, 5, 6]
 
     KERNEL_FLOYD_STEINBERG = 0
-    KERNEL_JJN = 1
-    KERNEL_STUCKI = 2
-    KERNEL_BURKES = 3
+    KERNEL_JJN             = 1
+    KERNEL_STUCKI          = 2
+    KERNEL_BURKES          = 3
 
     _width = D_COLS
     _height = D_ROWS
 
     rotation = 0
-    # gfx_* calls use a rotation numbering mirrored from this board's own `rotation`:
-    # board rotation 0 corresponds to gfx.c rotation 2, and 1/3 swap relative to
-    # Inkplate6COLOR's/Inkplate2's own +2 offset. Kept separate from `rotation` itself
-    # since the dual-chip palette image-decode path expects this board's native rotation
-    # numbering unchanged. See set_rotation().
-    _gfx_rotation = 2
-    text_size = 1
+    textSize = 1
 
-    _panel_state = False
+    _panelState = False
 
     _framebuf = None
 
+    @classmethod
     def begin(self):
-        self.wire = I2C(0)
 
-        # RST/DC/CS_M/CS_S/BUSY/CLK/DIN/PWR_EN/BS0/BS1 + the SPI peripheral itself are
-        # owned by the C dual-chip SPI transport from here on
-        # (firmware/usermods/inkplate/epd_spi.c) -- no more machine.SPI/Pin objects
-        # for the panel itself.
-        inkplate.select_spi_panel("inkplate13spectra")
+        # Initialize SPI with Spectra133 pins at 10MHz
+        self.spi = SPI(2, baudrate=10000000, polarity=0, phase=0, firstbit=SPI.MSB,
+                       sck=Pin(EPAPER_SPI_SCK), mosi=Pin(EPAPER_SPI_MOSI), miso=Pin(EPAPER_SPI_MISO))
 
-        # This panel's 4bpp framebuffer packs even physical x into the high nibble, the
-        # opposite of gfx_set_pixel's default. Session-constant, set once here.
-        inkplate.gfx_set_gs4_nibble_swap(True)
-
-        # Discharge panel capacitors first; setIO() (which brings up the SPI bus itself)
-        # only runs later, on the first set_panel_state(True).
-        self.set_panel_pins_to_low()
-
-        self.VBAT = ADC(Pin(1))
-        self.VBAT.atten(ADC.ATTN_11DB)
-        self.VBAT.width(ADC.WIDTH_12BIT)
+        # Initialize panel control pins
+        self.EPAPER_BUSY_PIN = Pin(EPAPER_BUSY_PIN, Pin.IN)
+        self.EPAPER_RST_PIN = Pin(EPAPER_RST_PIN, Pin.OUT)
+        self.EPAPER_DC_PIN = Pin(EPAPER_DC_PIN, Pin.OUT)
+        self.EPAPER_CS_M_PIN = Pin(EPAPER_CS_M_PIN, Pin.OUT)
+        self.EPAPER_CS_S_PIN = Pin(EPAPER_CS_S_PIN, Pin.OUT)
+        self.EPAPER_PWR_EN = Pin(EPAPER_PWR_EN, Pin.OUT)
+        self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT)
+        self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT)
 
         self.cursor = [0, 0]
         self.textColor = 0
         self.textWrapping = 1
+        
+        # Discharge panel capacitors first
+        self.setPanelPinsToLow()
 
-        # Allocate framebuffer (4bpp, 2 pixels per byte).
-        # Single C-level bytes multiply + bytearray copy, no Python loop.
-        self._framebuf = bytearray(b"\x11" * (D_COLS * D_ROWS // 2))
+        # Allocate framebuffer (4bpp, 2 pixels per byte)
+        # Single C-level bytes multiply + bytearray copy - no Python loop
+        self._framebuf = bytearray(b'\x11' * (D_COLS * D_ROWS // 2))
 
-        # Set default rotation (landscape).
+        # Set default rotation (landscape, matching Arduino initDriver)
         self.rotation = 1
-        self._gfx_rotation = (2 - self.rotation) % 4
         self._width = D_ROWS
         self._height = D_COLS
 
-        self.font_family = montserrat_black
-        self.font = self.font_family._font
+        self.GFX = GFX(
+            self._width,
+            self._height,
+            self.writePixel,
+            self.writeFastHLine,
+            self.writeFastVLine,
+            self.writeFillRect,
+            None,
+            None,
+        )
+        # Physical framebuffer row width for direct-write functions (text rendering)
+        self.GFX.phys_row_bytes = D_COLS // 2
+        # Color palette for mapping user indices to panel values in text rendering
+        self.GFX.color_palette = self._colorPalette
+        # Sync rotation so text rendering applies the correct transform
+        self.GFX.rotation = self.rotation
 
-        self._panel_state = False
+        self._panelState = False
 
         return True
 
-    def get_panel_state(self):
-        return self._panel_state
+    def initSDCard(self, fastBoot=False):
+        self.SD_ENABLE.digitalWrite(0)
+        try:
+            os.mount(
+                SDCard(
+                    slot=3,
+                    miso=Pin(13),
+                    mosi=Pin(11),
+                    sck=Pin(12),
+                    cs=Pin(10)),
+                "/sd"
+            )
+            if fastBoot == True:
+                if machine.reset_cause() == machine.PWRON_RESET or machine.reset_cause() == machine.HARD_RESET or machine.reset_cause() == machine.WDT_RESET:
+                    machine.soft_reset()
+        except:
+            print("Sd card could not be read")
 
-    def set_panel_pins_to_low(self):
+    def SDCardSleep(self):
+        self.SD_ENABLE.digitalWrite(1)
+        time.sleep_ms(5)
+
+    def SDCardWake(self):
+        self.SD_ENABLE.digitalWrite(0)
+        time.sleep_ms(5)
+
+    @classmethod
+    def setPCALForLowPower(self):
+
+        for x in range(16):
+            self._PCAL6416A.pinMode(int(x), modeOUTPUT)
+            self._PCAL6416A.digitalWrite(int(x), 0)
+
+    @classmethod
+    def getPanelState(self):
+        return self._panelState
+
+    @classmethod
+    def setPanelPinsToLow(self):
         """Discharge panel capacitors by driving all pins low."""
-        inkplate.spi_dual_pins_low()
+        self.EPAPER_DC_PIN = Pin(EPAPER_DC_PIN, Pin.OUT, value=0)
+        self.EPAPER_CS_M_PIN = Pin(EPAPER_CS_M_PIN, Pin.OUT, value=0)
+        self.EPAPER_CS_S_PIN = Pin(EPAPER_CS_S_PIN, Pin.OUT, value=0)
+        self.EPAPER_RST_PIN = Pin(EPAPER_RST_PIN, Pin.OUT, value=0)
+        self.EPAPER_BUSY_PIN = Pin(EPAPER_BUSY_PIN, Pin.OUT, value=0)
+        self.EPAPER_PWR_EN = Pin(EPAPER_PWR_EN, Pin.OUT, value=0)
+        self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT, value=0)
+        self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT, value=0)
 
-    def set_io(self):
+    @classmethod
+    def setIO(self):
         """Configure GPIOs and SPI for panel communication."""
-        inkplate.spi_dual_power_up_io()
+        self.EPAPER_DC_PIN = Pin(EPAPER_DC_PIN, Pin.OUT, value=1)
+        self.EPAPER_CS_M_PIN = Pin(EPAPER_CS_M_PIN, Pin.OUT, value=1)
+        self.EPAPER_CS_S_PIN = Pin(EPAPER_CS_S_PIN, Pin.OUT, value=1)
+        self.EPAPER_RST_PIN = Pin(EPAPER_RST_PIN, Pin.OUT, value=0)
+        self.EPAPER_BUSY_PIN = Pin(EPAPER_BUSY_PIN, Pin.IN, Pin.PULL_UP)
+        self.EPAPER_PWR_EN = Pin(EPAPER_PWR_EN, Pin.OUT, value=0)
+        self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT, value=0)
+        self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT, value=1)
 
-    def reset_panel(self):
-        """Hardware reset of the panel.
+        # Re-init SPI after pin reconfiguration
+        self.spi = SPI(2, baudrate=10000000, polarity=0, phase=0, firstbit=SPI.MSB,
+                       sck=Pin(EPAPER_SPI_SCK), mosi=Pin(EPAPER_SPI_MOSI), miso=Pin(EPAPER_SPI_MISO))
 
-        Reuses the single-chip family's epd_spi_reset() (100ms low / 200ms recovery)
-        rather than a dual-chip-specific 100ms/100ms pulse; a longer recovery delay
-        does not hurt.
-        """
-        inkplate.spi_panel_reset()
+    @classmethod
+    def resetPanel(self):
+        """Hardware reset of the panel."""
+        self.EPAPER_RST_PIN.value(0)
+        time.sleep_ms(100)
+        self.EPAPER_RST_PIN.value(1)
+        time.sleep_ms(100)
 
-    def wait_for_busy(self):
+    @classmethod
+    def waitForBusy(self):
         """Wait until the panel signals ready (BUSY pin goes high)."""
-        inkplate.spi_panel_wait_busy(1, 0)
+        while not self.EPAPER_BUSY_PIN.value():
+            time.sleep_ms(1)
 
-    def screen_init(self):
+    @classmethod
+    def screenInit(self):
         """Send manufacturer register init sequence to the panel."""
-        self.send_command(SPECTRA133_REG_AN_TM, REG_AN_TM_V, CHIP_MASTER)
-        self.send_command(SPECTRA133_REG_CMD66, REG_CMD66_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_PSR, REG_PSR_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_PLL, REG_PLL_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_CDI, REG_CDI_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_TCON, REG_TCON_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_AGID, REG_AGID_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_PWS, REG_PWS_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_CCSET, REG_CCSET_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_TRES, REG_TRES_V, CHIP_BOTH)
-        self.send_command(SPECTRA133_REG_PWR, REG_PWR_V, CHIP_MASTER)
-        self.send_command(SPECTRA133_REG_EN_BUF, REG_EN_BUF_V, CHIP_MASTER)
-        self.send_command(SPECTRA133_REG_BTST_P, REG_BTST_P_V, CHIP_MASTER)
-        self.send_command(SPECTRA133_REG_BOOST_VDDP_EN, REG_BOOST_VDDP_EN_V, CHIP_MASTER)
-        self.send_command(SPECTRA133_REG_BTST_N, REG_BTST_N_V, CHIP_MASTER)
-        self.send_command(SPECTRA133_REG_BUCK_BOOST_VDDN, REG_BUCK_BOOST_VDDN_V, CHIP_MASTER)
-        self.send_command(SPECTRA133_REG_TFT_VCOM_POWER, REG_TFT_VCOM_POWER_V, CHIP_MASTER)
+        self.sendCommand(SPECTRA133_REG_AN_TM, REG_AN_TM_V, CHIP_MASTER)
+        self.sendCommand(SPECTRA133_REG_CMD66, REG_CMD66_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_PSR, REG_PSR_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_PLL, REG_PLL_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_CDI, REG_CDI_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_TCON, REG_TCON_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_AGID, REG_AGID_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_PWS, REG_PWS_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_CCSET, REG_CCSET_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_TRES, REG_TRES_V, CHIP_BOTH)
+        self.sendCommand(SPECTRA133_REG_PWR, REG_PWR_V, CHIP_MASTER)
+        self.sendCommand(SPECTRA133_REG_EN_BUF, REG_EN_BUF_V, CHIP_MASTER)
+        self.sendCommand(SPECTRA133_REG_BTST_P, REG_BTST_P_V, CHIP_MASTER)
+        self.sendCommand(SPECTRA133_REG_BOOST_VDDP_EN, REG_BOOST_VDDP_EN_V, CHIP_MASTER)
+        self.sendCommand(SPECTRA133_REG_BTST_N, REG_BTST_N_V, CHIP_MASTER)
+        self.sendCommand(SPECTRA133_REG_BUCK_BOOST_VDDN, REG_BUCK_BOOST_VDDN_V, CHIP_MASTER)
+        self.sendCommand(SPECTRA133_REG_TFT_VCOM_POWER, REG_TFT_VCOM_POWER_V, CHIP_MASTER)
 
-    def set_panel_state(self, state):
+    @classmethod
+    def setPanelState(self, state):
         """Power on/off the panel. When powering on, performs full init sequence."""
-        if state == self._panel_state:
+        if state == self._panelState:
             return
 
         if state:
             # Power up sequence
-            self.set_panel_pins_to_low()
+            self.setPanelPinsToLow()
             time.sleep_ms(50)
 
-            # Configure GPIOs (also (re)inits the SPI bus/device -- see
-            # epd_spi_dual_power_up_io()'s own comment)
-            self.set_io()
+            # Configure GPIOs
+            self.setIO()
 
             # Enable power
-            inkplate.spi_dual_set_power(1)
+            self.EPAPER_PWR_EN.value(1)
             time.sleep_ms(100)
 
             # Hardware reset
-            self.reset_panel()
+            self.resetPanel()
             time.sleep_ms(100)
 
             # Send init registers
-            self.screen_init()
+            self.screenInit()
 
             # Power on command
-            self.send_command(SPECTRA133_REG_PON, None, CHIP_BOTH)
-            self.wait_for_busy()
+            self.sendCommand(SPECTRA133_REG_PON, None, CHIP_BOTH)
+            self.waitForBusy()
         else:
             # Power off sequence
-            self.send_command(SPECTRA133_REG_POF, REG_POF_V, CHIP_BOTH)
-            self.wait_for_busy()
+            self.sendCommand(SPECTRA133_REG_POF, REG_POF_V, CHIP_BOTH)
+            self.waitForBusy()
 
-            # Float DC/CS_M/CS_S/RST/BUSY/PWR_EN to save power (BS0/BS1 deliberately left
-            # alone -- see epd_spi_dual_power_down_io()'s own comment).
-            inkplate.spi_dual_power_down_io()
+            # Set pins to input to save power
+            self.EPAPER_DC_PIN = Pin(EPAPER_DC_PIN, Pin.IN)
+            self.EPAPER_CS_M_PIN = Pin(EPAPER_CS_M_PIN, Pin.IN)
+            self.EPAPER_CS_S_PIN = Pin(EPAPER_CS_S_PIN, Pin.IN)
+            self.EPAPER_RST_PIN = Pin(EPAPER_RST_PIN, Pin.IN)
+            self.EPAPER_BUSY_PIN = Pin(EPAPER_BUSY_PIN, Pin.IN)
+            self.EPAPER_PWR_EN = Pin(EPAPER_PWR_EN, Pin.IN)
 
-        self._panel_state = state
+            # Disable power
+            Pin(EPAPER_PWR_EN, Pin.OUT, value=0)
 
-    def send_command(self, cmd, data=None, chip_id=CHIP_BOTH):
+        self._panelState = state
+
+    @classmethod
+    def sendCommand(self, cmd, data=None, chip_id=CHIP_BOTH):
         """Send a command (and optional data) to master, slave, or both chips."""
-        inkplate.spi_dual_select(chip_id)
-        inkplate.spi_dual_write(bytes([cmd]))
+        # Assert chip select(s)
+        if chip_id & CHIP_SLAVE:
+            self.EPAPER_CS_S_PIN.value(0)
+        if chip_id & CHIP_MASTER:
+            self.EPAPER_CS_M_PIN.value(0)
+
+        # Send command byte
+        self.spi.write(bytes([cmd]))
+
+        # Send data bytes if provided
         if data is not None:
-            inkplate.spi_dual_write(data)
-        inkplate.spi_dual_deselect(chip_id)
+            self.spi.write(data)
 
-    def clear_display(self):
+        # Release chip select(s)
+        if chip_id & CHIP_SLAVE:
+            self.EPAPER_CS_S_PIN.value(1)
+        if chip_id & CHIP_MASTER:
+            self.EPAPER_CS_M_PIN.value(1)
+
+    @classmethod
+    def clearDisplay(self):
         if self._framebuf is None:
-            self._framebuf = bytearray(b"\x11" * (D_COLS * D_ROWS // 2))
+            self._framebuf = bytearray(b'\x11' * (D_COLS * D_ROWS // 2))
         else:
-            self._framebuf[:] = b"\x11" * len(self._framebuf)
+            self._framebuf[:] = b'\x11' * len(self._framebuf)
 
-    def display(self, leave_on=False):
+    @classmethod
+    def display(self, leaveOn=False):
         """Update display with framebuffer data using dual-chip architecture."""
         # Power up the panel
-        self.set_panel_state(True)
+        self.setPanelState(True)
 
         mv = memoryview(self._framebuf)
         half_row = D_COLS // 4  # 300 bytes per half-row
 
         # Send data to master chip (left side of screen)
-        inkplate.spi_dual_select(CHIP_MASTER)
-        inkplate.spi_dual_write(bytes([SPECTRA133_REG_DTM]))
+        self.EPAPER_CS_M_PIN.value(0)
+        self.EPAPER_CS_S_PIN.value(1)
+        self.spi.write(bytes([SPECTRA133_REG_DTM]))
         for i in range(D_ROWS):
             row_start = i * (D_COLS // 2)
-            inkplate.spi_dual_write(mv[row_start : row_start + half_row])
-        inkplate.spi_dual_deselect(CHIP_MASTER)
+            self.spi.write(mv[row_start:row_start + half_row])
+        self.EPAPER_CS_M_PIN.value(1)
 
         # Send data to slave chip (right side of screen)
-        self.wait_for_busy()
-        inkplate.spi_dual_select(CHIP_SLAVE)
-        inkplate.spi_dual_write(bytes([SPECTRA133_REG_DTM]))
+        self.EPAPER_CS_M_PIN.value(1)
+        self.EPAPER_CS_S_PIN.value(0)
+        self.waitForBusy()
+        self.spi.write(bytes([SPECTRA133_REG_DTM]))
         for i in range(D_ROWS):
             row_start = i * (D_COLS // 2) + half_row
-            inkplate.spi_dual_write(mv[row_start : row_start + half_row])
-        inkplate.spi_dual_deselect(CHIP_SLAVE)
+            self.spi.write(mv[row_start:row_start + half_row])
+        self.EPAPER_CS_S_PIN.value(1)
 
-        self.wait_for_busy()
+        # Deselect both chips
+        self.EPAPER_CS_S_PIN.value(1)
+        self.EPAPER_CS_M_PIN.value(1)
+        self.waitForBusy()
 
         # Force display refresh on both chips
-        self.send_command(SPECTRA133_REG_DRF, REG_DRF_V, CHIP_BOTH)
-        self.wait_for_busy()
+        self.sendCommand(SPECTRA133_REG_DRF, REG_DRF_V, CHIP_BOTH)
+        self.waitForBusy()
 
         # Power off if not requested to leave on
-        if not leave_on:
-            self.set_panel_state(False)
+        if not leaveOn:
+            self.setPanelState(False)
 
-    # Refreshes only a sub-rectangle of the panel via the GDEP133C02 controller's PTLW
-    # (Partial Load Window) register, instead of a full-frame refresh. Unlike
-    # Inkplate10's InkplatePartial (which diffs an old/new framebuffer pair pixel-by-
-    # pixel to suppress ghosting), this does no diffing at all -- it unconditionally
-    # re-sends the current framebuffer contents inside the given window. x/y/w/h are in
-    # this board's normal rotation-aware user-space coordinates (same space as
-    # draw_rect/write_pixel/etc).
-    def display_partial(self, x, y, w, h, leave_on=False):
-        # Clip to the screen bounds for the current rotation.
-        if x < 0:
-            w += x
-            x = 0
-        if y < 0:
-            h += y
-            y = 0
-        if x + w > self.width():
-            w = self.width() - x
-        if y + h > self.height():
-            h = self.height() - y
-        if w <= 0 or h <= 0:
-            return
+    @classmethod
+    def gpioExpanderPin(self, pin, mode):
+        return gpioPin(self._PCAL6416A, pin, mode)
 
-        # Map user rectangle to panel-native rectangle (col: 0..D_COLS-1, row:
-        # 0..D_ROWS-1). Uses `self.rotation`, NOT `_gfx_rotation` (gfx.c's offset
-        # numbering used by the drawing primitives).
-        r = self.rotation
-        if r == 0:
-            # User space: D_COLS x D_ROWS. panel_col = (D_COLS-1)-x, panel_row = (D_ROWS-1)-y.
-            col_start = D_COLS - x - w
-            col_end = D_COLS - 1 - x
-            row_start = D_ROWS - y - h
-            row_end = D_ROWS - 1 - y
-        elif r == 2:
-            # User space: D_COLS x D_ROWS. Identity -- no transform.
-            col_start = x
-            col_end = x + w - 1
-            row_start = y
-            row_end = y + h - 1
-        elif r == 3:
-            # User space: D_ROWS x D_COLS. panel_col = (D_COLS-1)-y, panel_row = x.
-            col_start = D_COLS - y - h
-            col_end = D_COLS - 1 - y
-            row_start = x
-            row_end = x + w - 1
-        else:  # r == 1
-            # User space: D_ROWS x D_COLS. panel_col = y, panel_row = (D_ROWS-1)-x.
-            col_start = y
-            col_end = y + h - 1
-            row_start = D_ROWS - x - w
-            row_end = D_ROWS - 1 - x
+    @classmethod
+    def rtc_dec_to_bcd(cls, val):
+        return (val // 10 * 16) + (val % 10)
 
-        # PTLW alignment requirements (GDEP133C02): H: col_start and (col_end+1) must
-        # both be multiples of 4. V: row_start must be even; (row_end+1) must be even.
-        col_start = (col_start // 4) * 4
-        col_end = (((col_end + 4) // 4) * 4) - 1
-        if col_end >= D_COLS:
-            col_end = D_COLS - 1
-        if row_start % 2 != 0:
-            row_start -= 1
-        if row_start < 0:
-            row_start = 0
-        if (row_end + 1) % 2 != 0:
-            row_end += 1
-        if row_end >= D_ROWS:
-            row_end = D_ROWS - 1
+    @classmethod
+    def rtc_bcd_to_dec(cls, val):
+        return (val // 16 * 10) + (val % 16)
 
-        self.set_panel_state(True)
+    @classmethod
+    def rtc_set_time(cls, rtc_hour, rtc_minute, rtc_second):
+        data = bytearray([
+            RTC_RAM_by,
+            170,  # Write in RAM 170 to know that RTC is set
+            cls.rtc_dec_to_bcd(rtc_second),
+            cls.rtc_dec_to_bcd(rtc_minute),
+            cls.rtc_dec_to_bcd(rtc_hour)
+        ])
 
-        half_width = D_COLS // 2  # 600 px per chip
-        half_bytes = half_width // 2  # 300 bytes per row per chip
-        row_stride = D_COLS // 2  # 600 bytes per full framebuffer row
+        cls.wire.writeto(RTC_I2C_ADDR, data)
 
-        master_needed = col_start < half_width
-        slave_needed = col_end >= half_width
+    @classmethod
+    def rtc_set_date(cls, rtc_weekday, rtc_day, rtc_month, rtc_yr):
+        rtcYear = rtc_yr - 2000
 
-        # Both chips must receive a full PTLW+DTM cycle before DRF, otherwise the
-        # uninvolved chip falls back to a full-panel refresh when DRF fires. For the
-        # uninvolved chip, a minimal 4x4 null window is used: it re-sends the existing
-        # framebuffer data (same as what's already on screen), so the refresh produces
-        # no visible change on that side.
-        ptlw_null = bytes(
-            [
-                0x00,
-                0x00,  # HRST = 0
-                0x00,
-                0x07,  # HRED = 7
-                0x00,
-                0x00,  # VRST = 0
-                0x00,
-                0x01,  # VRED = 1
-                0x01,  # PT = 1 (enable)
-            ]
-        )
+        data = bytearray([
+            RTC_RAM_by,
+            170,  # Write in RAM 170 to know that RTC is set
+        ])
 
-        mv = memoryview(self._framebuf)
+        cls.wire.writeto(RTC_I2C_ADDR, data)
 
-        def send_chip(chip_id, needed, local_col_start, local_col_end, mem_col_off):
-            if needed:
-                hrst = local_col_start * 2
-                hred = (local_col_end + 1) * 2 - 1
-                vrst = row_start // 2
-                vred = (row_end + 1) // 2 - 1
-                ptlw = bytes(
-                    [
-                        (hrst >> 8) & 0xFF,
-                        hrst & 0xFF,
-                        (hred >> 8) & 0xFF,
-                        hred & 0xFF,
-                        (vrst >> 8) & 0xFF,
-                        vrst & 0xFF,
-                        (vred >> 8) & 0xFF,
-                        vred & 0xFF,
-                        0x01,
-                    ]
-                )
-                bytes_per_row = (local_col_end - local_col_start + 1) // 2
-                r_start, r_end = row_start, row_end
-            else:
-                ptlw = ptlw_null
-                bytes_per_row = 2  # 4 px / 2 px-per-byte
-                r_start, r_end = 0, 3
+        data = bytearray([
+            RTC_DAY_ADDR,
+            cls.rtc_dec_to_bcd(rtc_day),
+            cls.rtc_dec_to_bcd(rtc_weekday),
+            cls.rtc_dec_to_bcd(rtc_month),
+            cls.rtc_dec_to_bcd(rtcYear),
+        ])
 
-            self.send_command(SPECTRA133_REG_CMD66, REG_CMD66_V, chip_id)
-            self.send_command(SPECTRA133_REG_PTLW, ptlw, chip_id)
+        cls.wire.writeto(RTC_I2C_ADDR, data)
 
-            inkplate.spi_dual_select(chip_id)
-            inkplate.spi_dual_write(bytes([SPECTRA133_REG_DTM]))
-            for row in range(r_start, r_end + 1):
-                off = row * row_stride + mem_col_off
-                inkplate.spi_dual_write(mv[off : off + bytes_per_row])
-            inkplate.spi_dual_deselect(chip_id)
+    @classmethod
+    def rtc_get_rtc_data(cls):
+        cls.wire.writeto(RTC_I2C_ADDR, bytearray([RTC_SECOND_ADDR]))
+        data = cls.wire.readfrom(RTC_I2C_ADDR, 7)
 
-        # Master chip (left half of the screen)
-        if master_needed:
-            lcs = col_start
-            lce = col_end if col_end < half_width else half_width - 1
-            send_chip(CHIP_MASTER, True, lcs, lce, lcs // 2)
-        else:
-            send_chip(CHIP_MASTER, False, 0, 0, 0)
+        rtc_second = cls.rtc_bcd_to_dec(data[0] & 0x7F)  # Ignore bit 7
+        rtc_minute = cls.rtc_bcd_to_dec(data[1] & 0x7F)
+        rtc_hour = cls.rtc_bcd_to_dec(data[2] & 0x3F)  # Ignore bits 7 & 6
+        rtc_day = cls.rtc_bcd_to_dec(data[3] & 0x3F)
+        rtc_weekday = cls.rtc_bcd_to_dec(data[4] & 0x07)  # Ignore bits 7,6,5,4 & 3
+        rtc_month = cls.rtc_bcd_to_dec(data[5] & 0x1F)  # Ignore bits 7,6 & 5
+        rtc_year = cls.rtc_bcd_to_dec(data[6]) + 2000
 
-        # Slave chip (right half of the screen)
-        self.wait_for_busy()
-        if slave_needed:
-            lcs = (col_start - half_width) if col_start >= half_width else 0
-            lce = col_end - half_width
-            send_chip(CHIP_SLAVE, True, lcs, lce, half_bytes + lcs // 2)
-        else:
-            send_chip(CHIP_SLAVE, False, 0, 0, half_bytes)
+        return {
+            'second': rtc_second,
+            'minute': rtc_minute,
+            'hour': rtc_hour,
+            'day': rtc_day,
+            'weekday': rtc_weekday,
+            'month': rtc_month,
+            'year': rtc_year
+        }
 
-        self.wait_for_busy()
-
-        # Both chips have received PTLW+DTM; trigger a coordinated refresh.
-        self.send_command(SPECTRA133_REG_DRF, REG_DRF_V, CHIP_BOTH)
-        self.wait_for_busy()
-
-        if not leave_on:
-            self.set_panel_state(False)
-
+    @classmethod
     def clean(self):
         """Clear the physical display by sending all-white data."""
-        self.set_panel_state(True)
+        self.setPanelState(True)
 
         half_row = D_COLS // 4  # 300 bytes per half-row
-        white_half = b"\x11" * half_row
+        white_half = b'\x11' * half_row
 
         # Send white data to master chip (left side)
-        inkplate.spi_dual_select(CHIP_MASTER)
-        inkplate.spi_dual_write(bytes([SPECTRA133_REG_DTM]))
+        self.EPAPER_CS_M_PIN.value(0)
+        self.EPAPER_CS_S_PIN.value(1)
+        self.spi.write(bytes([SPECTRA133_REG_DTM]))
         for i in range(D_ROWS):
-            inkplate.spi_dual_write(white_half)
-        inkplate.spi_dual_deselect(CHIP_MASTER)
+            self.spi.write(white_half)
+        self.EPAPER_CS_M_PIN.value(1)
 
         # Send white data to slave chip (right side)
-        self.wait_for_busy()
-        inkplate.spi_dual_select(CHIP_SLAVE)
-        inkplate.spi_dual_write(bytes([SPECTRA133_REG_DTM]))
+        self.EPAPER_CS_M_PIN.value(1)
+        self.EPAPER_CS_S_PIN.value(0)
+        self.waitForBusy()
+        self.spi.write(bytes([SPECTRA133_REG_DTM]))
         for i in range(D_ROWS):
-            inkplate.spi_dual_write(white_half)
-        inkplate.spi_dual_deselect(CHIP_SLAVE)
+            self.spi.write(white_half)
+        self.EPAPER_CS_S_PIN.value(1)
 
-        self.wait_for_busy()
+        # Deselect both
+        self.EPAPER_CS_S_PIN.value(1)
+        self.EPAPER_CS_M_PIN.value(1)
+        self.waitForBusy()
 
         # Force display refresh
-        self.send_command(SPECTRA133_REG_DRF, REG_DRF_V, CHIP_BOTH)
-        self.wait_for_busy()
+        self.sendCommand(SPECTRA133_REG_DRF, REG_DRF_V, CHIP_BOTH)
+        self.waitForBusy()
 
-        self.set_panel_state(False)
+        self.setPanelState(False)
 
+    @classmethod
     def width(self):
         return self._width
 
+    @classmethod
     def height(self):
         return self._height
 
-    def set_rotation(self, x):
+    # Arduino compatibility functions
+    @classmethod
+    def setRotation(self, x):
         self.rotation = x % 4
-        self._gfx_rotation = (2 - self.rotation) % 4
         if self.rotation == 0 or self.rotation == 2:
+            self.GFX.width = D_COLS
+            self.GFX.height = D_ROWS
             self._width = D_COLS
             self._height = D_ROWS
         elif self.rotation == 1 or self.rotation == 3:
+            self.GFX.width = D_ROWS
+            self.GFX.height = D_COLS
             self._width = D_ROWS
             self._height = D_COLS
+        self.GFX.rotation = self.rotation
 
-    def get_rotation(self):
+    @classmethod
+    def getRotation(self):
         return self.rotation
 
-    def draw_pixel(self, x, y, c):
-        self.start_write()
-        self.write_pixel(x, y, c)
-        self.end_write()
+    @classmethod
+    def drawPixel(self, x, y, c):
+        self.startWrite()
+        self.writePixel(x, y, c)
+        self.endWrite()
 
-    def start_write(self):
+    @classmethod
+    def startWrite(self):
         pass
 
-    # Maps a user color index (0-5) to the panel's real register value, or None if out
-    # of range. Every gfx_* wrapper below does this once per call instead of once per
-    # pixel.
-    def _map_color(self, c):
+    @classmethod
+    @micropython.native
+    def writePixel(self, x, y, c):
+        w = self.width()
+        h = self.height()
+
+        if x < 0 or y < 0 or x >= w or y >= h:
+            return
         if c > 5:
-            return None
-        return self._color_palette[c]
-
-    def write_pixel(self, x, y, c):
-        c = self._map_color(c)
-        if c is None:
             return
-        inkplate.gfx_set_pixel(self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, c)
 
-    def write_fill_rect(self, x, y, w, h, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_fill_rect(self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, w, h, c)
+        # Map user color index to panel color value
+        c = self._colorPalette[c]
 
-    def write_fast_vline(self, x, y, h, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_vline(self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, h, c)
+        r = self.rotation
+        if r == 0:
+            x = w - x - 1
+            y = h - y - 1
+        elif r == 1:
+            x, y = y, w - x - 1
+        elif r == 3:
+            x, y = h - y - 1, x
+        # r == 2: no change needed
 
-    def write_fast_hline(self, x, y, w, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_hline(self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, w, c)
+        idx = (D_COLS * y) >> 1
+        shift = (x & 1) * 4
+        mask = pixelMaskGLUT[x & 1]
 
-    def set_text_color(self, c):
+        self._framebuf[idx + (x >> 1)] = (self._framebuf[idx + (x >> 1)] & mask) | (c << (4 - shift))
+
+
+
+    @classmethod
+    def writeFillRect(self, x, y, w, h, c):
+        for j in range(w):
+            for i in range(h):
+                self.writePixel(x + j, y + i, c)
+
+    @classmethod
+    def writeFastVLine(self, x, y, h, c):
+        for i in range(h):
+            self.writePixel(x, y + i, c)
+
+    @classmethod
+    def writeFastHLine(self, x, y, w, c):
+        for i in range(w):
+            self.writePixel(x + i, y, c)
+    @classmethod
+    def setTextColor(self, c):
         self.textColor = c
 
-    def write_line(self, x0, y0, x1, y1, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_line(self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x0, y0, x1, y1, c)
+    @classmethod
+    def writeLine(self, x0, y0, x1, y1, c):
+        self.GFX.line(x0, y0, x1, y1, c)
 
-    def end_write(self):
+    @classmethod
+    def endWrite(self):
         pass
 
-    def draw_fast_vline(self, x, y, h, c):
-        self.start_write()
-        self.write_fast_vline(x, y, h, c)
-        self.end_write()
+    @classmethod
+    def drawFastVLine(self, x, y, h, c):
+        self.startWrite()
+        self.writeFastVLine(x, y, h, c)
+        self.endWrite()
 
-    def draw_fast_hline(self, x, y, w, c):
-        self.start_write()
-        self.write_fast_hline(x, y, w, c)
-        self.end_write()
+    @classmethod
+    def drawFastHLine(self, x, y, w, c):
+        self.startWrite()
+        self.writeFastHLine(x, y, w, c)
+        self.endWrite()
 
-    def fill_rect(self, x, y, w, h, c):
-        self.start_write()
-        self.write_fill_rect(x, y, w, h, c)
-        self.end_write()
+    @classmethod
+    def fillRect(self, x, y, w, h, c):
+        self.startWrite()
+        self.writeFillRect(x, y, w, h, c)
+        self.endWrite()
 
-    def fill_screen(self, c):
-        self.fill_rect(0, 0, self.width(), self.height(), c)
+    @classmethod
+    def fillScreen(self, c):
+        self.fillRect(0, 0, self.width(), self.height(), c)
 
-    def draw_line(self, x0, y0, x1, y1, c):
-        self.start_write()
-        self.write_line(x0, y0, x1, y1, c)
-        self.end_write()
+    @classmethod
+    def drawLine(self, x0, y0, x1, y1, c):
+        self.startWrite()
+        self.writeLine(x0, y0, x1, y1, c)
+        self.endWrite()
 
-    def draw_rect(self, x, y, w, h, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_rect(self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, w, h, c)
+    @classmethod
+    def drawRect(self, x, y, w, h, c):
+        self.GFX.rect(x, y, w, h, c)
 
-    def draw_circle(self, x, y, r, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_circle(self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, r, c)
+    @classmethod
+    def drawCircle(self, x, y, r, c):
+        self.GFX.circle(x, y, r, c)
 
-    def fill_circle(self, x, y, r, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_fill_circle(self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, r, c)
+    @classmethod
+    def fillCircle(self, x, y, r, c):
+        self.GFX.fill_circle(x, y, r, c)
 
-    def draw_triangle(self, x0, y0, x1, y1, x2, y2, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_triangle(
-            self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x0, y0, x1, y1, x2, y2, c
-        )
+    @classmethod
+    def drawTriangle(self, x0, y0, x1, y1, x2, y2, c):
+        self.GFX.triangle(x0, y0, x1, y1, x2, y2, c)
 
-    def fill_triangle(self, x0, y0, x1, y1, x2, y2, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_fill_triangle(
-            self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x0, y0, x1, y1, x2, y2, c
-        )
+    @classmethod
+    def fillTriangle(self, x0, y0, x1, y1, x2, y2, c):
+        self.GFX.fill_triangle(x0, y0, x1, y1, x2, y2, c)
 
-    def draw_round_rect(self, x, y, q, h, r, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_round_rect(
-            self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, q, h, r, c
-        )
+    @classmethod
+    def drawRoundRect(self, x, y, q, h, r, c):
+        self.GFX.round_rect(x, y, q, h, r, c)
 
-    def fill_round_rect(self, x, y, q, h, r, c):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_fill_round_rect(
-            self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, q, h, r, c
-        )
+    @classmethod
+    def fillRoundRect(self, x, y, q, h, r, c):
+        self.GFX.fill_round_rect(x, y, q, h, r, c)
+    @classmethod
+    def setTextWrapping(self, state:bool):
+        self.textWrapping=state
 
-    def set_text_wrapping(self, state: bool):
-        self.textWrapping = state
-
-    def set_display_mode(self, mode):
+    @classmethod
+    def setDisplayMode(self, mode):
         self.displayMode = mode
 
-    def get_display_mode(self):
+    @classmethod
+    def selectDisplayMode(self, mode):
+        self.displayMode = mode
+
+    @classmethod
+    def getDisplayMode(self):
         return self.displayMode
 
-    def set_text_size(self, s):
-        self.text_size = s
+    @classmethod
+    def setTextSize(self, s):
+        self.textSize = s
 
-    def set_font(self, f):
-        self.font_family = f
-        self.font = self.font_family._font
+    @classmethod
+    def setFont(self, f):
+        self.GFX.font_family = f
+        self.GFX.font=self.GFX.font_family._font
 
-    def reset_cursor(self):
-        self.cursor = [0, 0]
+    def resetCursor(self):
+        self.cursor=[0,0]
 
-    def set_cursor(self, x, y):
-        self.cursor = [x, y]
+    def setCursor(self, x, y):
+        self.cursor=[x,y]
 
-    # Color goes through _color_palette once here instead of once per pixel, like
-    # every other gfx_* wrapper on this board.
-    def _print_text(self, framebuf, x0, y0, string, size, color, text_wrap=False):
-        display_width = self._width
-        color = self._color_palette[min(max(color, 0), 5)]
-
-        x = int(x0)
-        y = int(y0)
-        line_height = 0
-
-        def blit(cx, cy, char_data, ch_w, ch_h):
-            inkplate.gfx_draw_char(
-                framebuf,
-                D_COLS,
-                D_ROWS,
-                self._gfx_rotation,
-                1,
-                cx,
-                cy,
-                char_data,
-                ch_w,
-                ch_h,
-                size,
-                color,
-            )
-
-        for chunk in string.split("__"):
-            try:
-                char_data, ch_h, ch_w = self.font_family.get_ch(chunk)
-                line_height = max(line_height, ch_h * size)
-
-                if text_wrap is True and x + ch_w * size > display_width:
-                    x = 0
-                    y += line_height
-                    line_height = ch_h * size
-
-                blit(x, y, char_data, ch_w, ch_h)
-                x += ch_w * size
-            except (ValueError, TypeError):
-                for char in chunk:
-                    if char == "\n":
-                        x = x0
-                        y += line_height
-                        line_height = 0
-                        continue
-
-                    try:
-                        char_data, ch_h, ch_w = self.font_family.get_ch(char)
-                    except (ValueError, TypeError):
-                        char_data, ch_h, ch_w = self.font_family.get_ch("?")
-
-                    line_height = max(line_height, ch_h * size)
-
-                    if text_wrap is True and x + ch_w * size > display_width:
-                        x = 0
-                        y += line_height
-                        line_height = ch_h * size
-
-                    blit(x, y, char_data, ch_w, ch_h)
-                    x += ch_w * size
-        return [x, y], line_height
-
-    def print_text(self, x, y, s):
-        self._print_text(
-            self._framebuf,
-            x,
-            y,
-            s,
-            self.text_size,
-            self.textColor,
-            text_wrap=self.textWrapping,
-        )
-
+    def printText(self, x, y, s):
+        self.GFX._print_text(self._framebuf,x, y, s, self.textSize, self.textColor, text_wrap=self.textWrapping)
+            
     def println(self, text):
-        self.cursor, line_height = self._print_text(
-            self._framebuf,
-            self.cursor[0],
-            self.cursor[1],
-            text,
-            self.text_size,
-            self.textColor,
-            text_wrap=self.textWrapping,
-        )
-        self.cursor[1] += line_height
-        self.cursor[0] = 0
-
+        self.cursor,line_height = self.GFX._print_text(self._framebuf,self.cursor[0], self.cursor[1], text, self.textSize, self.textColor, text_wrap=self.textWrapping)
+        self.cursor[1]+=line_height
+        self.cursor[0]=0
+        
     def print(self, text):
-        self.cursor, line_height = self._print_text(
-            self._framebuf,
-            self.cursor[0],
-            self.cursor[1],
-            text,
-            self.text_size,
-            self.textColor,
-            text_wrap=self.textWrapping,
-        )
-
-    def wrap_text(self, text, max_chars):
+        self.cursor,line_height = self.GFX._print_text(self._framebuf,self.cursor[0], self.cursor[1], text, self.textSize, self.textColor, text_wrap=self.textWrapping)
+        
+    def wrap_text(self,text, max_chars):
         lines = []
-        for paragraph in text.split("\n"):
+        for paragraph in text.split('\n'):
             while len(paragraph) > max_chars:
                 # Find last space within limit
-                wrap_at = paragraph.rfind(" ", 0, max_chars)
+                wrap_at = paragraph.rfind(' ', 0, max_chars)
                 if wrap_at == -1:
                     wrap_at = max_chars
                 lines.append(paragraph[:wrap_at])
@@ -751,38 +694,930 @@ class Ee02(ImagePaletteMixin):
             if paragraph:
                 lines.append(paragraph)
         return lines
-
-    def draw_text_box(self, x0, y0, x1, y1, text, line_height=20, text_size=None):
-        if text_size is not None:
-            self.set_text_size(text_size)
-        max_width = x1 - x0
-        char_width = 6 * self.text_size  # rough estimate
+    
+    def drawTextBox(self, x0, y0, x1, y1, text, line_height=20, text_size=None):
+        
+        if text_size != None:
+            self.setTextSize(text_size)
+        max_width=x1-x0
+        char_width = 6 * self.textSize  # rough estimate
         max_chars = max_width // char_width
         lines = self.wrap_text(text, max_chars)
-        y = y0
+        max_height=y1
+        y=y0
         for line in lines:
-            if y > y1 - 2 * line_height:
-                s = list(line)
-                s[-1] = "."
-                s[-2] = "."
-                s[-3] = "."
-                s = "".join(s)
-                self.print_text(x0, y, s)
+            if y > y1 - 2*line_height:
+                s=list(line)
+                s[-1]='.'
+                s[-2]='.'
+                s[-3]='.'
+                s="".join(s)
+                self.printText(x0, y, s)
                 break
-            self.print_text(x0, y, line)
+            self.printText(x0, y, line)
             y += line_height
 
-    def draw_bitmap(self, x, y, data, w, h, c=BLACK):
-        c = self._map_color(c)
-        if c is None:
-            return
-        inkplate.gfx_draw_bitmap(
-            self._framebuf, D_COLS, D_ROWS, self._gfx_rotation, 1, x, y, data, w, h, c
-        )
+    def readBattery(cls):
+        cls.VBAT_EN.digitalWrite(1)
+        # Probably don't need to delay since Micropython is slow, but we do it anyway
+        time.sleep_ms(1)
+        value = cls.VBAT.read()
+        cls.VBAT_EN.digitalWrite(0)
+        result = (value / 4095.0) * 1.1 * 3.548133892 * 2
+        return result
+
+    @classmethod
+    def drawBitmap(self, x, y, data, w, h, c=BLACK):
+        byteWidth = (w + 7) // 8
+        byte = 0
+        self.startWrite()
+        for j in range(h):
+            for i in range(w):
+                if i & 7:
+                    byte <<= 1
+                else:
+                    byte = data[j * byteWidth + i // 8]
+                if byte & 0x80:
+                    self.writePixel(x + i, y + j, c)
+        self.endWrite()
+
+    def drawColorImage(self, x, y, width, height, image):
+        for i in range(0, len(image)):
+            # Unpack the byte into two pixel values
+            pixel_value1 = (image[i] & 0b11110000) >> 4
+            pixel_value2 = image[i] & 0b00001111
+
+            # Calculate the x and y coordinates of the pixels
+            x1 = (2*i) % width
+            y1 = (2*i) // width
+            x2 = (2*i + 1) % width
+            y2 = (2*i + 1) // width
+
+            # Check if the coordinates are within the image bounds
+            if x1 < width and y1 < height:
+                self.writePixel(x1 + x, y1 + y, pixel_value1)
+            if x2 < width and y2 < height:
+                self.writePixel(x2 + x, y2 + y, pixel_value2)
+    
+    def rtcSetTime(self, rtc_hour, rtc_minute, rtc_second):
+        return self.rtc_set_time(rtc_hour, rtc_minute, rtc_second)
+
+    def rtcSetDate(self, rtc_weekday, rtc_day, rtc_month, rtc_yr):
+        return self.rtc_set_date(rtc_weekday, rtc_day, rtc_month, rtc_yr)
+
+    def rtcGetData(self):
+        return self.rtc_get_rtc_data()
+    
+    def drawImage(self, path, x0=0, y0=0, invert=False, dither=False, kernel_type=0):
+        """
+        Draw an image from either web URL or local file system
+        Args:
+            path: Either a web URL (http/https) or local file path
+            x0, y0: Coordinates for top-left corner of image
+            dither: Whether to apply dithering
+            kernel_type: Dithering kernel type (0=Floyd-Steinberg, etc.)
+            invert: Invert colors
+        """
+        # Check if path is a web URL
+        if path.startswith(('http://', 'https://')):
+            # Determine image type from URL
+            if path.lower().endswith('.bmp'):
+                self.drawBMPFromWeb(path, x0, y0, invert, dither)
+            elif path.lower().endswith('.jpg') or path.lower().endswith('.jpeg'):
+                self.drawJPGFromWeb(path, x0, y0, invert, dither, kernel_type)
+            elif path.lower().endswith('.png'):
+                self.drawPNGFromWeb(path, x0, y0, invert, dither, kernel_type)
+            else:
+                raise ValueError("Unsupported web image format. Must be .bmp, .jpg, or .png")
+        else:
+            # Handle local file
+            if path.lower().endswith('.bmp'):
+                self.drawBMPFromSd(path, x0, y0,invert, dither)
+            elif path.lower().endswith('.jpg') or path.lower().endswith('.jpeg'):
+                self.drawJPGFromSd(path, x0, y0, invert, dither, kernel_type)
+            elif path.lower().endswith('.png'):
+                self.drawPNGFromSd(path, x0, y0, invert, dither, kernel_type)
+            else:
+                raise ValueError("Unsupported local image format. Must be .bmp, .jpg, or .png")
+    
+    
+    
+    def drawJPGFromSd(self, path, x0=0, y0=0, invert=False, dither:bool=False, kernel_type:int=0):
+        import jpeg
+        import gc
+        import time
+        
+        try:
+            # 1. Initialize decoder
+
+            decoder = jpeg.Decoder(rotation=0, format="CbYCrY", clipper_width=self._width, clipper_height=self._height)
+            
+            # 2. Read file
+            with open(path, "rb") as f:
+                jpeg_data = f.read()
+            
+            # 3. Get image info before decoding
+            try:
+                width, height = decoder.get_img_info(jpeg_data)[0:2]
+            except Exception as e:
+                print(e)
+                decoder = jpeg.Decoder(rotation=0, format="CbYCrY")
+                width, height = decoder.get_img_info(jpeg_data)[0:2]
+            
+
+                
+            
+            # 4. Decode image
+            decoded = decoder.decode(jpeg_data)
+            
+            from array import array
+            
+            draw_width = self._width
+            err_cur, err_next = array('h', (0 for _ in range(draw_width*3))), array('h', (0 for _ in range(draw_width*3)))
+            
+            Inkplate.writeImage(self._framebuf, x0, y0, width, height, decoded, invert, dither, kernel_type, err_cur, err_next)
+            
+            gc.collect()
+            
+        
+        except Exception as e:
+            print("\nJPEG Decode error:", e)
+            raise
+    
+    # Color palette (6 Spectra colors)
+    palette = [
+            (0, 0, 0),        # 0 black
+            (255, 255, 255),  # 1 white
+            (255, 255, 0),    # 2 yellow
+            (255, 0, 0),      # 3 red
+            (0, 0, 255),      # 4 blue  (panel val 5)
+            (0, 255, 0),      # 5 green (panel val 6)
+        ]
+        
+    def drawJPGFromSd(self, path, x0=0, y0=0, invert=False, dither:bool=False, kernel_type:int=0):
+        import jpeg
+        import gc
+        import time
+        
+        try:
+            # 1. Initialize decoder
+
+            decoder = jpeg.Decoder(rotation=0, format="RGB565_LE", clipper_width=self._width, clipper_height=self._height)
+            
+            # 2. Read file
+            with open(path, "rb") as f:
+                jpeg_data = f.read()
+            
+            # 3. Get image info before decoding
+            try:
+                width, height = decoder.get_img_info(jpeg_data)[0:2]
+            except Exception as e:
+                print(e)
+                decoder = jpeg.Decoder(rotation=0, format="RGB565_LE")
+                width, height = decoder.get_img_info(jpeg_data)[0:2]
+                
+            # 4. Decode image
+            decoded = decoder.decode(jpeg_data)
+            
+            
+            Inkplate.writeImage(self._framebuf, x0, y0, width, height, decoded, invert, dither, kernel_type)
+            
+            gc.collect()
+            
+        
+        except Exception as e:
+            print("\nJPEG Decode error:", e)
+            raise
+    
+
+    @staticmethod
+    @micropython.viper
+    def writeImage(framebuf: ptr8, x0: int, y0: int, width: int, height: int, imagedata: ptr8, invert: bool, dither: bool, kernel_type: int):
+        # Physical framebuffer: 1200 columns x 1600 rows, 4bpp
+        _PHYS_WIDTH = const(1200)
+        _BYTES_PER_ROW = const(_PHYS_WIDTH // 2)  # 600 bytes per physical row
+        # Logical screen dimensions (rotation 1: landscape)
+        _SCREEN_WIDTH = const(1600)
+        _SCREEN_HEIGHT = const(1200)
+
+        # Dithering kernels (dx, dy, wt) — weights will be pre-scaled (<<6) to avoid divides
+        fs_dx = (1, -1, 0, 1)
+        fs_dy = (0,  1, 1, 1)
+        fs_wt = (7,  3, 5, 1);  fs_div = 16
+
+        jjn_dx = (1, 2, -2, -1, 0, 1, 2)
+        jjn_dy = (0, 0,  1,  1, 1, 1, 1)
+        jjn_wt = (7, 5,  3,  5, 7, 5, 3); jjn_div = 48
+
+        stucki_dx = (1, 2, -2, -1, 0, 1, 2)
+        stucki_dy = (0, 0,  1,  1, 1, 1, 1)
+        stucki_wt = (8, 4,  2,  4, 8, 4, 2); stucki_div = 42
+
+        burkes_dx = (1, 2, -2, -1, 0, 1, 2)
+        burkes_dy = (0, 0,  1,  1, 1, 1, 1)
+        burkes_wt = (8, 4,  2,  4, 8, 4, 2); burkes_div = 32
+
+        # Palette flattened: 6 Spectra colors
+        # Panel values: 0=black, 1=white, 2=yellow, 3=red, 5=blue, 6=green
+        p0r = 0   ; p0g = 0   ; p0b = 0     # black  (panel val 0)
+        p1r = 255 ; p1g = 255 ; p1b = 255   # white  (panel val 1)
+        p2r = 255 ; p2g = 255 ; p2b = 0     # yellow (panel val 2)
+        p3r = 255 ; p3g = 0   ; p3b = 0     # red    (panel val 3)
+        p4r = 0   ; p4g = 0   ; p4b = 255   # blue   (panel val 5)
+        p5r = 0   ; p5g = 255 ; p5b = 0     # green  (panel val 6)
+
+        draw_width: int = width if (x0 + width) <= _SCREEN_WIDTH else _SCREEN_WIDTH - x0
+        draw_height: int = height if (y0 + height) <= _SCREEN_HEIGHT else _SCREEN_HEIGHT - y0
+
+        inv_mask: int = 0x0F if invert else 0x00
+        
+        # Select kernel and pre-scale weights by 64 (>>6 later)
+        dx0:int = 0; dx1:int = 0; dx2:int = 0; dx3:int = 0
+        dx4:int = 0; dx5:int = 0; dx6:int = 0
+        dy0:int = 0; dy1:int = 0; dy2:int = 0; dy3:int = 0
+        dy4:int = 0; dy5:int = 0; dy6:int = 0
+
+        # Prepare dithering
+        kernel_len: int = 0
+        if dither:
+            errbuf_size: int = draw_width * 3  # RGB error per pixel (signed byte in [-128,127] encoded as 0..255)
+            error_current = bytearray(errbuf_size)
+            error_next = bytearray(errbuf_size)
+            error_current_ptr = ptr8(error_current)
+            error_next_ptr = ptr8(error_next)
+
+            # Select kernel and pre-scale weights by 64 (>>6 later)
+            # Select kernel and pre-scale weights by 64 (>>6 later)
+            if kernel_type == 1:
+                # Jarvis, Judice, Ninke
+                dx0 = int(jjn_dx[0]); dy0 = int(jjn_dy[0])
+                dx1 = int(jjn_dx[1]); dy1 = int(jjn_dy[1])
+                dx2 = int(jjn_dx[2]); dy2 = int(jjn_dy[2])
+                dx3 = int(jjn_dx[3]); dy3 = int(jjn_dy[3])
+                dx4 = int(jjn_dx[4]); dy4 = int(jjn_dy[4])
+                dx5 = int(jjn_dx[5]); dy5 = int(jjn_dy[5])
+                dx6 = int(jjn_dx[6]); dy6 = int(jjn_dy[6])
+                coeff0:int = (int(jjn_wt[0]) << 6) // jjn_div
+                coeff1:int = (int(jjn_wt[1]) << 6) // jjn_div
+                coeff2:int = (int(jjn_wt[2]) << 6) // jjn_div
+                coeff3:int = (int(jjn_wt[3]) << 6) // jjn_div
+                coeff4:int = (int(jjn_wt[4]) << 6) // jjn_div
+                coeff5:int = (int(jjn_wt[5]) << 6) // jjn_div
+                coeff6:int = (int(jjn_wt[6]) << 6) // jjn_div
+                kernel_len:int = 7
+
+            elif kernel_type == 2:
+                # Stucki
+                dx0 = int(stucki_dx[0]); dy0 = int(stucki_dy[0])
+                dx1 = int(stucki_dx[1]); dy1 = int(stucki_dy[1])
+                dx2 = int(stucki_dx[2]); dy2 = int(stucki_dy[2])
+                dx3 = int(stucki_dx[3]); dy3 = int(stucki_dy[3])
+                dx4 = int(stucki_dx[4]); dy4 = int(stucki_dy[4])
+                dx5 = int(stucki_dx[5]); dy5 = int(stucki_dy[5])
+                dx6 = int(stucki_dx[6]); dy6 = int(stucki_dy[6])
+                coeff0:int = (int(stucki_wt[0]) << 6) // stucki_div
+                coeff1:int = (int(stucki_wt[1]) << 6) // stucki_div
+                coeff2:int = (int(stucki_wt[2]) << 6) // stucki_div
+                coeff3:int = (int(stucki_wt[3]) << 6) // stucki_div
+                coeff4:int = (int(stucki_wt[4]) << 6) // stucki_div
+                coeff5:int = (int(stucki_wt[5]) << 6) // stucki_div
+                coeff6:int = (int(stucki_wt[6]) << 6) // stucki_div
+                kernel_len:int = 7
+
+            elif kernel_type == 3:
+                # Burkes
+                dx0 = int(burkes_dx[0]); dy0 = int(burkes_dy[0])
+                dx1 = int(burkes_dx[1]); dy1 = int(burkes_dy[1])
+                dx2 = int(burkes_dx[2]); dy2 = int(burkes_dy[2])
+                dx3 = int(burkes_dx[3]); dy3 = int(burkes_dy[3])
+                dx4 = int(burkes_dx[4]); dy4 = int(burkes_dy[4])
+                dx5 = int(burkes_dx[5]); dy5 = int(burkes_dy[5])
+                dx6 = int(burkes_dx[6]); dy6 = int(burkes_dy[6])
+                coeff0:int = (int(burkes_wt[0]) << 6) // burkes_div
+                coeff1:int = (int(burkes_wt[1]) << 6) // burkes_div
+                coeff2:int = (int(burkes_wt[2]) << 6) // burkes_div
+                coeff3:int = (int(burkes_wt[3]) << 6) // burkes_div
+                coeff4:int = (int(burkes_wt[4]) << 6) // burkes_div
+                coeff5:int = (int(burkes_wt[5]) << 6) // burkes_div
+                coeff6:int = (int(burkes_wt[6]) << 6) // burkes_div
+                kernel_len:int = 7
+
+            else:
+                # Floyd–Steinberg
+                dx0 = int(fs_dx[0]); dy0 = int(fs_dy[0])
+                dx1 = int(fs_dx[1]); dy1 = int(fs_dy[1])
+                dx2 = int(fs_dx[2]); dy2 = int(fs_dy[2])
+                dx3 = int(fs_dx[3]); dy3 = int(fs_dy[3])
+                coeff0:int = (int(fs_wt[0]) << 6) // fs_div
+                coeff1:int = (int(fs_wt[1]) << 6) // fs_div
+                coeff2:int = (int(fs_wt[2]) << 6) // fs_div
+                coeff3:int = (int(fs_wt[3]) << 6) // fs_div
+                kernel_len:int = 4
 
 
-if __name__ == "__main__":
-    print(
-        "WARNING: You are running the Inkplate module itself, import this module "
-        "into your example and use it that way"
-    )
+        else:
+            # Dummy pointers to satisfy types, not used
+            error_current_ptr = ptr8(bytearray(0))
+            error_next_ptr = ptr8(bytearray(0))
+
+        # Dithering error diffusion helper — defined once, called per-pixel when dithering
+        @micropython.viper
+        def _accum(error_current_ptr: ptr8, error_next_ptr: ptr8,
+                   nx: int, ny: int, row: int, draw_width: int, draw_height: int,
+                   dyv: int, k: int, cr: int, cg: int, cb: int):
+            if nx < 0 or nx >= draw_width or ny < 0 or ny >= draw_height:
+                return
+            target: ptr8 = error_next_ptr if dyv else error_current_ptr
+            tpos: int = nx * 3
+            tr: int = target[tpos]
+            if tr > 127:
+                tr -= 256
+            tg: int = target[tpos + 1]
+            if tg > 127:
+                tg -= 256
+            tb: int = target[tpos + 2]
+            if tb > 127:
+                tb -= 256
+            tr += (cr * k) >> 6
+            tg += (cg * k) >> 6
+            tb += (cb * k) >> 6
+            if tr < -128: tr = -128
+            elif tr > 127: tr = 127
+            if tg < -128: tg = -128
+            elif tg > 127: tg = 127
+            if tb < -128: tb = -128
+            elif tb > 127: tb = 127
+            target[tpos]     = tr + 256 if tr < 0 else tr
+            target[tpos + 1] = tg + 256 if tg < 0 else tg
+            target[tpos + 2] = tb + 256 if tb < 0 else tb
+
+        # Pre-compute the starting phys_y for col=0 (constant across all rows)
+        base_phys_y: int = _SCREEN_WIDTH - 1 - x0
+
+        row:int = 0
+        while row < draw_height:
+            img_row_start: int = row * width * 2
+
+            # Rotation 1: phys_x = y0 + row (constant for entire row)
+            phys_x: int = y0 + row
+            phys_x_half: int = phys_x >> 1
+            nibble_odd: int = phys_x & 1
+
+            # fb_idx for col=0; decrements by _BYTES_PER_ROW per col
+            fb_idx: int = base_phys_y * _BYTES_PER_ROW + phys_x_half
+
+            col:int = 0
+            while col < draw_width:
+                idx:int = img_row_start + (col * 2)
+                pixel:int = imagedata[idx] | (imagedata[idx + 1] << 8)
+
+                # RGB565 -> RGB888 (bit expand)
+                r_:int = (pixel >> 8) & 0xF8
+                g_:int = (pixel >> 3) & 0xFC
+                b_:int = (pixel << 3) & 0xF8
+                r_ |= r_ >> 5
+                g_ |= g_ >> 6
+                b_ |= b_ >> 5
+
+                if dither:
+                    epos:int = col * 3
+                    er:int = error_current_ptr[epos]
+                    if er > 127:
+                        er -= 256
+                    eg:int = error_current_ptr[epos + 1]
+                    if eg > 127:
+                        eg -= 256
+                    eb:int = error_current_ptr[epos + 2]
+                    if eb > 127:
+                        eb -= 256
+
+                    r_ += er
+                    g_ += eg
+                    b_ += eb
+                    if r_ < 0: r_ = 0
+                    elif r_ > 255: r_ = 255
+                    if g_ < 0: g_ = 0
+                    elif g_ > 255: g_ = 255
+                    if b_ < 0: b_ = 0
+                    elif b_ > 255: b_ = 255
+
+                # Unrolled nearest-color search over 6 Spectra palette entries
+                best_idx:int = 0
+                dr:int = r_ - 0   ; dg:int = g_ - 0   ; db:int = b_ - 0
+                best_dist:int = dr*dr + dg*dg + db*db
+
+                dr = r_ - 255 ; dg = g_ - 255 ; db = b_ - 255
+                dist:int = dr*dr + dg*dg + db*db
+                if dist < best_dist:
+                    best_dist = dist ; best_idx = 1
+
+                dr = r_ - 255 ; dg = g_ - 255 ; db = b_ - 0
+                dist = dr*dr + dg*dg + db*db
+                if dist < best_dist:
+                    best_dist = dist ; best_idx = 2
+
+                dr = r_ - 255 ; dg = g_ - 0   ; db = b_ - 0
+                dist = dr*dr + dg*dg + db*db
+                if dist < best_dist:
+                    best_dist = dist ; best_idx = 3
+
+                dr = r_ - 0   ; dg = g_ - 0   ; db = b_ - 255
+                dist = dr*dr + dg*dg + db*db
+                if dist < best_dist:
+                    best_dist = dist ; best_idx = 5
+
+                dr = r_ - 0   ; dg = g_ - 255 ; db = b_ - 0
+                dist = dr*dr + dg*dg + db*db
+                if dist < best_dist:
+                    best_dist = dist ; best_idx = 6
+
+                val:int = best_idx ^ inv_mask
+
+                # Write to framebuffer using pre-computed index and nibble position
+                fb_val:int = framebuf[fb_idx]
+                if nibble_odd:
+                    framebuf[fb_idx] = (fb_val & 0xF0) | val
+                else:
+                    framebuf[fb_idx] = (fb_val & 0x0F) | (val << 4)
+
+                if dither:
+                    if best_idx == 0:
+                        pr = 0   ; pg = 0   ; pb = 0
+                    elif best_idx == 1:
+                        pr = 255 ; pg = 255 ; pb = 255
+                    elif best_idx == 2:
+                        pr = 255 ; pg = 255 ; pb = 0
+                    elif best_idx == 3:
+                        pr = 255 ; pg = 0   ; pb = 0
+                    elif best_idx == 5:
+                        pr = 0   ; pg = 0   ; pb = 255
+                    else:
+                        pr = 0   ; pg = 255 ; pb = 0
+
+                    drq:int = r_ - pr
+                    dgq:int = g_ - pg
+                    dbq:int = b_ - pb
+
+                    nx0:int = col + dx0; dy0:int = dy0
+                    _accum(error_current_ptr, error_next_ptr,
+                           nx0, row + dy0, row, draw_width, draw_height,
+                           dy0, coeff0, drq, dgq, dbq)
+
+                    nx1:int = col + dx1; dy1:int = dy1
+                    _accum(error_current_ptr, error_next_ptr,
+                           nx1, row + dy1, row, draw_width, draw_height,
+                           dy1, coeff1, drq, dgq, dbq)
+
+                    nx2:int = col + dx2; dy2:int = dy2
+                    _accum(error_current_ptr, error_next_ptr,
+                           nx2, row + dy2, row, draw_width, draw_height,
+                           dy2, coeff2, drq, dgq, dbq)
+
+                    nx3:int = col + dx3; dy3:int = dy3
+                    _accum(error_current_ptr, error_next_ptr,
+                           nx3, row + dy3, row, draw_width, draw_height,
+                           dy3, coeff3, drq, dgq, dbq)
+
+                    if kernel_len == 7:
+                        nx4:int = col + dx4; dy4:int = dy4
+                        _accum(error_current_ptr, error_next_ptr,
+                               nx4, row + dy4, row, draw_width, draw_height,
+                               dy4, coeff4, drq, dgq, dbq)
+
+                        nx5:int = col + dx5; dy5:int = dy5
+                        _accum(error_current_ptr, error_next_ptr,
+                               nx5, row + dy5, row, draw_width, draw_height,
+                               dy5, coeff5, drq, dgq, dbq)
+
+                        nx6:int = col + dx6; dy6:int = dy6
+                        _accum(error_current_ptr, error_next_ptr,
+                               nx6, row + dy6, row, draw_width, draw_height,
+                               dy6, coeff6, drq, dgq, dbq)
+
+                # Advance to next col: phys_y decreases by 1, so fb_idx drops by one row
+                fb_idx -= _BYTES_PER_ROW
+                col += 1
+
+            if dither:
+                tmp = error_current_ptr
+                error_current_ptr = error_next_ptr
+                error_next_ptr = tmp
+                i2:int = 0
+                while i2 < errbuf_size:
+                    error_next_ptr[i2] = 0
+                    i2 += 1
+
+            row += 1
+    
+    def drawPNGFromSd(self, path, x0=0, y0=0, invert=False, dither=False, kernel_type=0):
+        import gc
+        with open(path, 'rb') as f:
+            png_data = f.read()
+
+        width,height,png_data=Inkplate.png_to_rgb565(png_data, len(png_data))
+        
+        Inkplate.writeImage(self._framebuf, x0, y0, width, height, png_data, invert, dither, kernel_type)
+        
+        gc.collect()
+    
+    def drawPNGFromWeb(self, url, x0=0, y0=0, invert=False, dither=False, kernel_type=0):
+        import gc
+        import urequests
+        import ssl
+        
+        try:
+            response = urequests.get(url, timeout=10)
+            if response.status_code != 200:
+                print(f"HTTP Error {response.status_code}")
+            
+            png_data = response.content
+            response.close()
+            
+            width,height,png_data=Inkplate.png_to_rgb565(png_data, len(png_data))
+        
+            Inkplate.writeImage(self._framebuf, x0, y0, width, height, png_data, invert, dither, kernel_type)
+            
+            gc.collect()
+        except Exception as e:
+            print("Error in drawPNGFromWeb:", e)
+            if 'response' in locals():
+                response.close()
+
+    def drawJPGFromWeb(self, url, x0=0, y0=0, invert=False, dither:bool=False, kernel_type:int=0):
+        import jpeg
+        import gc
+        import urequests
+        import ssl
+        
+        try:
+            # 1. Initialize decoder
+            decoder = jpeg.Decoder(rotation=0, format="RGB565_LE", clipper_width=self._width, clipper_height=self._height)
+            
+            # 2. Download the image (with timeout and basic error handling)
+            response = urequests.get(url, timeout=20)
+            if response.status_code != 200:
+                raise ValueError(f"HTTP Error {response.status_code}")
+            
+            jpeg_data = response.content
+            response.close()
+            
+            try:
+                width, height = decoder.get_img_info(jpeg_data)[0:2]
+            except Exception as e:
+                print(e)
+                decoder = jpeg.Decoder(rotation=0, format="RGB565_LE")
+                width, height = decoder.get_img_info(jpeg_data)[0:2]
+            
+            # 4. Decode image
+            decoded = decoder.decode(jpeg_data)
+            
+
+            Inkplate.writeImage(self._framebuf, x0, y0, width, height, decoded, invert, dither, kernel_type)
+            
+            gc.collect()
+            
+            
+        except Exception as e:
+            print("Error in drawJPGFromWeb:", e)
+            if 'response' in locals():
+                response.close()
+            raise
+        
+
+    _PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+
+    @micropython.viper
+    def png_to_rgb565(png_data: ptr8, png_len: int):
+        import deflate
+        import io
+        import array
+        from uctypes import addressof, bytearray_at
+        # --- Signature check ---
+        if (png_data[0] != 0x89 or png_data[1] != 0x50 or png_data[2] != 0x4E or 
+            png_data[3] != 0x47 or png_data[4] != 0x0D or png_data[5] != 0x0A or 
+            png_data[6] != 0x1A or png_data[7] != 0x0A):
+            raise ValueError("Invalid PNG signature")
+
+        # --- Parse chunks (your original logic) ---
+        pos: int = 8
+        width: int = 0
+        height: int = 0
+        color_type: int = 0
+        idat_data = bytearray()
+
+        while pos + 8 <= png_len:
+            chunk_len: int = (png_data[pos] << 24) | (png_data[pos+1] << 16) | (png_data[pos+2] << 8) | png_data[pos+3]
+
+            is_ihdr = (png_data[pos+4] == 0x49 and 
+                       png_data[pos+5] == 0x48 and 
+                       png_data[pos+6] == 0x44 and 
+                       png_data[pos+7] == 0x52)
+
+            is_idat = (png_data[pos+4] == 0x49 and 
+                       png_data[pos+5] == 0x44 and 
+                       png_data[pos+6] == 0x41 and 
+                       png_data[pos+7] == 0x54)
+
+            is_iend = (png_data[pos+4] == 0x49 and 
+                       png_data[pos+5] == 0x45 and 
+                       png_data[pos+6] == 0x4E and 
+                       png_data[pos+7] == 0x44)
+
+            chunk_start: int = pos + 8
+
+            if is_ihdr:
+                width  = (png_data[chunk_start]   << 24) | (png_data[chunk_start+1] << 16) | (png_data[chunk_start+2] << 8) | png_data[chunk_start+3]
+                height = (png_data[chunk_start+4] << 24) | (png_data[chunk_start+5] << 16) | (png_data[chunk_start+6] << 8) | png_data[chunk_start+7]
+                color_type = png_data[chunk_start+9]
+                if color_type != 2 and color_type != 6:
+                    raise ValueError("Unsupported PNG color type")
+
+            elif is_idat:
+                # Original safe byte-by-byte copy
+                idat_chunk = bytearray(chunk_len)
+                i: int = 0
+                while i < chunk_len:
+                    idat_chunk[i] = png_data[chunk_start + i]
+                    i += 1
+                idat_data += idat_chunk
+
+            elif is_iend:
+                break
+
+            pos += chunk_len + 12
+
+        if width == 0 or height == 0:
+            raise ValueError("PNG missing IHDR chunk")
+        if not idat_data:
+            raise ValueError("PNG missing IDAT chunk")
+
+        # --- Setup decoding ---
+        bpp: int = 3 if color_type == 2 else 4
+        row_size: int = width * bpp
+        stride: int = row_size + 1
+
+        rgb565_data = array.array('H', bytearray(width * height * 2))
+        rgb565_ptr = ptr16(addressof(rgb565_data))
+
+        idat_mv = bytearray_at(addressof(idat_data), len(idat_data))
+        dstream = deflate.DeflateIO(io.BytesIO(idat_mv))
+
+        cur_buf = bytearray(row_size)
+        prev_buf = bytearray(row_size)
+        cur = ptr8(addressof(cur_buf))
+        prev = ptr8(addressof(prev_buf))
+
+        # zero previous row
+        i: int = 0
+        while i < row_size:
+            prev[i] = 0
+            i += 1
+
+        # --- Main loop ---
+        y: int = 0
+        while y < height:
+            raw = dstream.read(stride)
+            if not raw or int(len(raw)) != stride:
+                raise ValueError("Invalid PNG row data")
+
+            raw_ptr = ptr8(addressof(raw))
+            filt: int = raw_ptr[0]
+            rp = ptr8(int(raw_ptr) + 1)
+
+            # --- Filtering ---
+            x: int = 0
+            while x < row_size:
+                v: int = rp[x]
+                if filt == 1:  # Sub
+                    if x >= bpp:
+                        v = (v + cur[x - bpp]) & 0xFF
+                elif filt == 2:  # Up
+                    v = (v + prev[x]) & 0xFF
+                elif filt == 3:  # Average
+                    a = cur[x - bpp] if x >= bpp else 0
+                    b = prev[x]
+                    v = (v + ((a + b) >> 1)) & 0xFF
+                elif filt == 4:  # Paeth
+                    a = cur[x - bpp] if x >= bpp else 0
+                    b = prev[x]
+                    c = prev[x - bpp] if x >= bpp else 0
+                    p = a + b - c
+                    pa = p - a if p >= a else a - p
+                    pb = p - b if p >= b else b - p
+                    pc = p - c if p >= c else c - p
+                    pred = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                    v = (v + pred) & 0xFF
+                cur[x] = v
+                x += 1
+
+            # --- Convert to RGB565 ---
+            row_off: int = y * width
+            if bpp == 3:  # RGB
+                x = 0
+                while x < width:
+                    i = x * 3
+                    r = cur[i]; g = cur[i+1]; b = cur[i+2]
+                    rgb565_ptr[row_off + x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                    x += 1
+            else:  # RGBA
+                x = 0
+                while x < width:
+                    i = x * 4
+                    r = cur[i]; g = cur[i+1]; b = cur[i+2]; a = cur[i+3]
+                    if a < 255:
+                        r = (r * a) // 255
+                        g = (g * a) // 255
+                        b = (b * a) // 255
+                    rgb565_ptr[row_off + x] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                    x += 1
+
+            # swap buffers
+            tmp = cur
+            cur = prev
+            prev = tmp
+
+            y += 1
+
+        return (width, height, rgb565_data)
+    
+    
+    def drawBMPFromSd(self, path, x0=0, y0=0, invert=False, dither=False, kernel_type=0):
+        import gc
+        gc.collect()
+        with open(path, 'rb') as f:
+            bmp_data = f.read()
+
+        width,height,bmp_data=Inkplate.bmp24_to_rgb565(bmp_data, len(bmp_data))
+        
+        Inkplate.writeImage(self._framebuf, x0, y0, width, height, bmp_data, invert, dither, kernel_type)
+        del bmp_data
+        gc.collect()
+        
+    def drawBMPFromWeb(self, url, x0=0, y0=0, invert=False, dither=False, kernel_type = 0):
+        """Display a BMP image downloaded from the web
+        
+        Args:
+            bmp_data (bytes): Raw BMP file data
+            x0 (int): X position to start drawing
+            y0 (int): Y position to start drawing
+            invert (bool): Whether to invert colors
+            dither (bool): Whether to apply dithering
+        """
+        import gc
+        import urequests
+        import ssl
+    
+        try:
+            response = urequests.get(url, timeout=10)
+            if response.status_code != 200:
+                print(f"HTTP Error {response.status_code}")
+            
+            bmp_data = response.content
+            response.close()
+            width,height,bmp_data=Inkplate.bmp24_to_rgb565(bmp_data, len(bmp_data))
+        
+            Inkplate.writeImage(self._framebuf, x0, y0, width, height, bmp_data, invert, dither, kernel_type)
+            del bmp_data
+            gc.collect()
+        except Exception as e:
+            print("Error in drawBMPFromWeb:", e)
+            if 'response' in locals():
+                response.close()
+    
+
+    
+    @micropython.viper
+    def bmp24_to_rgb565(bmp_data: ptr8, bmp_len: int):
+        # keep imports inside the function per your environment
+        from uctypes import addressof
+        
+        @micropython.viper
+        def le32_and_sign(data: ptr8, off: int):
+            b0: int = data[off]
+            b1: int = data[off+1]
+            b2: int = data[off+2]
+            b3: int = data[off+3]
+            uval: int = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+            top_down: int = 0
+            if b3 & 0x80:    # negative
+                top_down = 1
+                # absolute value: two’s complement, but we can do (0 - uval)
+                uval = -uval
+            return uval, top_down
+
+        # --- File header checks (14 bytes) ---
+        # 'BM'
+        if bmp_len < 54 or bmp_data[0] != 0x42 or bmp_data[1] != 0x4D:
+            raise ValueError("Invalid BMP signature")
+
+        # Little-endian helpers (inline)
+        # le32 at offset 'o'
+        o: int = 10
+        pixel_ofs: int = (bmp_data[o] |
+                          (bmp_data[o+1] << 8) |
+                          (bmp_data[o+2] << 16) |
+                          (bmp_data[o+3] << 24))
+
+        # --- DIB header (assume BITMAPINFOHEADER >= 40 bytes) ---
+        dib_sz: int = (bmp_data[14] |
+                       (bmp_data[15] << 8) |
+                       (bmp_data[16] << 16) |
+                       (bmp_data[17] << 24))
+        if dib_sz < 40:
+            raise ValueError("Unsupported DIB header")
+
+        # width (int32 le)
+        w_off: int = 18
+        width: int = (bmp_data[w_off] |
+                      (bmp_data[w_off+1] << 8) |
+                      (bmp_data[w_off+2] << 16) |
+                      (bmp_data[w_off+3] << 24))
+        if width <= 0:
+            raise ValueError("Unsupported BMP width")
+
+        # height (int32 le, may be negative for top-down)
+        h_off: int = 22
+        b0: int = bmp_data[h_off]
+        b1: int = bmp_data[h_off+1]
+        b2: int = bmp_data[h_off+2]
+        b3: int = bmp_data[h_off+3]
+        height_le: int = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+        top_down: int = 0
+        if b3 & 0x80:     # check sign bit
+            top_down = 1
+            abs_height: int = -height_le   # safe negation, no big mask
+        else:
+            abs_height = height_le
+
+        if abs_height <= 0:
+            raise ValueError("Unsupported BMP height")
+
+        # planes (must be 1)
+        planes: int = (bmp_data[26] | (bmp_data[27] << 8))
+        if planes != 1:
+            raise ValueError("Invalid planes")
+
+        # bpp (must be 24)
+        bpp: int = (bmp_data[28] | (bmp_data[29] << 8))
+        if bpp != 24:
+            raise ValueError("Only 24-bit BMP supported")
+
+        # compression (must be BI_RGB = 0)
+        comp: int = (bmp_data[30] |
+                     (bmp_data[31] << 8) |
+                     (bmp_data[32] << 16) |
+                     (bmp_data[33] << 24))
+        if comp != 0:
+            raise ValueError("Compressed BMP not supported")
+
+        # row stride with 4-byte padding: ((width*3 + 3) & ~3)
+        bytes_per_row: int = width * 3
+        stride: int = (bytes_per_row + 3) // 4 * 4
+
+        # bounds check: pixel data must fit in file
+        total_data: int = stride * abs_height
+        if pixel_ofs + total_data > bmp_len:
+            raise ValueError("BMP pixel data truncated")
+
+        # --- Prepare output ---
+        out_sz: int = width * abs_height * 2
+        outbuf = bytearray(out_sz)
+        outp: ptr16 = ptr16(addressof(outbuf))
+
+        # constants for RGB565 pack
+        RMASK: int = 0xF8
+        GMASK: int = 0xFC
+
+        # --- Iterate rows/pixels ---
+        y: int = 0
+        while y < abs_height:
+            # source row selection (BMP is bottom-up unless top_down)
+            src_y: int = y if top_down == 1 else (abs_height - 1 - y)
+            src_base: int = pixel_ofs + src_y * stride
+
+            x: int = 0
+            while x < width:
+                px_off: int = src_base + x * 3
+                # BGR order in BMP
+                b: int = bmp_data[px_off]
+                g: int = bmp_data[px_off + 1]
+                r: int = bmp_data[px_off + 2]
+
+                # pack to RGB565
+                rgb565: int = ((r & RMASK) << 8) | ((g & GMASK) << 3) | (b >> 3)
+
+                out_index: int = y * width + x
+                outp[out_index] = rgb565
+
+                x += 1
+            y += 1
+
+
+        return (width, abs_height, outbuf)
+
+
+if __name__ == '__main__':
+    print("WARNING: You are running the Inkplate module itself, import this module into your example and use it that way")
+
+
