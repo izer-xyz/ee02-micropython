@@ -126,8 +126,8 @@ class Ee02:
         self.EPAPER_CS_M_PIN = Pin(EPAPER_CS_M_PIN, Pin.OUT)
         self.EPAPER_CS_S_PIN = Pin(EPAPER_CS_S_PIN, Pin.OUT)
         self.EPAPER_PWR_EN = Pin(EPAPER_PWR_EN, Pin.OUT)
-        self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT)
-        self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT)
+        #self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT)
+        #self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT)
 
         self.cursor = [0, 0]
         self.textColor = 0
@@ -212,8 +212,8 @@ class Ee02:
         self.EPAPER_RST_PIN = Pin(EPAPER_RST_PIN, Pin.OUT, value=0)
         self.EPAPER_BUSY_PIN = Pin(EPAPER_BUSY_PIN, Pin.OUT, value=0)
         self.EPAPER_PWR_EN = Pin(EPAPER_PWR_EN, Pin.OUT, value=0)
-        self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT, value=0)
-        self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT, value=0)
+        #self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT, value=0)
+        #self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT, value=0)
 
     @classmethod
     def setIO(self):
@@ -224,8 +224,8 @@ class Ee02:
         self.EPAPER_RST_PIN = Pin(EPAPER_RST_PIN, Pin.OUT, value=0)
         self.EPAPER_BUSY_PIN = Pin(EPAPER_BUSY_PIN, Pin.IN, Pin.PULL_UP)
         self.EPAPER_PWR_EN = Pin(EPAPER_PWR_EN, Pin.OUT, value=0)
-        self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT, value=0)
-        self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT, value=1)
+        #self.EPAPER_BS0 = Pin(EPAPER_BS0, Pin.OUT, value=0)
+        #self.EPAPER_BS1 = Pin(EPAPER_BS1, Pin.OUT, value=1)
 
         # Re-init SPI after pin reconfiguration
         self.spi = SPI(2, baudrate=10000000, polarity=0, phase=0, firstbit=SPI.MSB,
